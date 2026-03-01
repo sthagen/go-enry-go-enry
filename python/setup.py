@@ -1,46 +1,38 @@
-from logging import getLogger
-import shutil
 import subprocess
+import shutil
+from pathlib import Path
+from setuptools import setup, Distribution
 
-from setuptools import setup, find_packages
-from setuptools.command.develop import develop
-from setuptools.command.install import install
+class BinaryDistribution(Distribution):
+    def has_ext_modules(self):
+        return True
 
-logger = getLogger(__name__)
-
-
-def build_go_archive():
-    logger.info("Building C archive with static library")
-    if shutil.which("go") is None:
-        raise EnvironmentError("You should have Go installed and available on your path in order to build this module")
-    subprocess.check_output(["make", "static"], cwd="../")
-    logger.info("C archive successfully built")
-
-
-class build_static_and_develop(develop):
+def build_go_library():
+    # Only build if the library doesn't exist
+    # This allows GitHub Actions to 'pre-build' if desired, 
+    # but provides a fallback for cibuildwheel.
+    base_dir = Path(__file__).resolve().parent
+    enry_dir = base_dir / "enry"
+    lib_exists = any(enry_dir.glob("libenry.*"))
     
-    def run(self):
-        build_go_archive()
-        super(build_static_and_develop, self).run()
+    if not lib_exists:
+        print("Building Go shared library...")
+        # Path to the root where Makefile lives
+        root_dir = base_dir.parent
+        try:
+            # Explicitly call make shared
+            subprocess.check_call(["make", "shared"], cwd=root_dir)
+            # The Makefile likely puts the lib in shared/
+            # We need to make sure it's in python/enry/
+            for lib in (root_dir / "shared").glob("libenry.*"):
+                shutil.copy(lib, enry_dir)
+        except Exception as e:
+            print(f"Warning: Go build failed: {e}. If this is a wheel build, ensure Go is installed.")
 
-
-class build_static_and_install(install):
-    
-    def run(self):
-        build_go_archive()
-        super(build_static_and_install, self).run()
-
-
-with open("README.md", "r") as fh:
-    long_description = fh.read()
+# Trigger the build before setup
+build_go_library()
 
 setup(
-    name="enry",
-    version="0.1.1",
-    description="Python bindings for go-enry package",
-    setup_requires=["cffi>=1.0.0"],
+    distclass=BinaryDistribution,
     cffi_modules=["build_enry.py:ffibuilder"],
-    packages=find_packages(),
-    install_requires=["cffi>=1.0.0"],
-    cmdclass={"develop": build_static_and_develop, "install": build_static_and_install}
 )

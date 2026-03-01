@@ -1,77 +1,68 @@
-from _c_enry import ffi
+from enry._c_enry import ffi
 from enry.types import Guess
-from functools import wraps
-from typing import Hashable, List, Sequence
+from typing import List
 
+def go_str_to_py(lib, c_ptr) -> str:
+    """Converts a char* to Python str and frees the C memory via FreeCString."""
+    if c_ptr == ffi.NULL:
+        return ""
+    try:
+        # ffi.string converts the C pointer to a Python bytes object then we decode
+        return ffi.string(c_ptr).decode('utf-8')
+    finally:
+        # Every string returned as C.CString in Go MUST be freed
+        # We call Free on the lib object passed in from definitions.py
+        lib.FreeCString(c_ptr)
 
-def py_bytes_to_go(py_bytes: bytes):
-    c_bytes = ffi.new("char[]", py_bytes)
-    go_slice = ffi.new("GoSlice *", [c_bytes, len(py_bytes), len(py_bytes)])
-    return (go_slice[0], c_bytes)
+def go_str_slice_to_py(lib, c_ptr_array) -> List[str]:
+    """Converts a char** array to Python List[str] and frees it via FreeStringArray."""
+    if c_ptr_array == ffi.NULL:
+        return []
+    results = []
+    try:
+        i = 0
+        # We iterate until we find the NULL terminator we added in Go
+        while c_ptr_array[i] != ffi.NULL:
+            results.append(ffi.string(c_ptr_array[i]).decode('utf-8'))
+            i += 1
+        return results
+    finally:
+        # This one call frees the array AND all strings inside it
+        # We call Free on the lib object passed in from definitions.py
+        lib.FreeStringArray(c_ptr_array)
 
+def prepare_candidates(candidates: List[str]) -> tuple:
+    """Converts a Python list to a NULL-terminated char** array.
 
-def py_str_to_go(py_str: str):
-    str_bytes = py_str.encode()
-    c_str = ffi.new("char[]", str_bytes)
-    go_str = ffi.new("_GoString_ *", [c_str, len(str_bytes)])
-    return (go_str[0], c_str)
+    Semantics:
+    - candidates is None -> pass NULL to C (means "no filter" / use default behavior)
+    - candidates is [] (empty list) -> pass a non-NULL char** where the first
+      element is NULL (represents an explicit empty candidate list -> no results)
+    """
+    # Distinguish between None and an empty list
+    if candidates is None:
+        return ffi.NULL, None
 
+    # Explicit empty list: create a single-element array with a NULL terminator
+    if len(candidates) == 0:
+        c_list = ffi.new("char*[]", 1)
+        c_list[0] = ffi.NULL
+        return c_list, []
+    
+    # Create the array of pointers (size + 1 for the NULL terminator)
+    c_list = ffi.new("char*[]", len(candidates) + 1)
+    
+    # CFFI is smart: as long as c_strings stays in scope during the 
+    # lib call, the memory is safe.
+    c_strings = [ffi.new("char[]", c.encode('utf-8')) for c in candidates]
+    for i, c_str in enumerate(c_strings):
+        c_list[i] = c_str
+    
+    c_list[len(candidates)] = ffi.NULL
+    return c_list, c_strings  # Return c_strings to keep them in scope
 
-def go_str_to_py(go_str: str):
-    str_len = go_str.n
-    if str_len > 0:
-        return ffi.unpack(go_str.p, go_str.n).decode()
-    return ""
-
-
-def init_go_slice():
-    return ffi.new("GoSlice *")
-
-
-def go_str_slice_to_py(str_slice) -> List[str]:
-    slice_len = str_slice.len
-    char_arr = ffi.cast("char **", str_slice.data)
-    return [ffi.string(char_arr[i]).decode() for i in range(slice_len)]
-
-
-def go_bool_to_py(go_bool: bool):
-    return go_bool == 1
-
-
-def go_guess_to_py(guess) -> Guess:
-    return Guess(go_str_to_py(guess.r0), go_bool_to_py(guess.r1))
-
-
-py_to_go = {
-    str: py_str_to_go,
-    bytes: py_bytes_to_go,
-}
-
-
-go_to_py = {
-    str: go_str_to_py,
-    bool: go_bool_to_py,
-    Guess: go_guess_to_py,
-}
-
-
-def transform_types(in_types: Sequence[Hashable], out_type: Hashable):
-    def decorator(fn):
-        @wraps(fn)
-        def inner(*args):
-            args_transformed = [py_to_go[type_](arg) for type_, arg in zip(in_types, args)]
-            return go_to_py[out_type](fn(*(arg[0] for arg in args_transformed)))
-        return inner
-    return decorator
-
-
-def transform_types_ret_str_slice(in_types: Sequence[Hashable]):
-    def decorator(fn):
-        @wraps(fn)
-        def inner(*args):
-            ret_slice = init_go_slice()
-            args_transformed = [py_to_go[type_](arg) for type_, arg in zip(in_types, args)]
-            fn(*(arg[0] for arg in args_transformed), ret_slice)
-            return go_str_slice_to_py(ret_slice)
-        return inner
-    return decorator
+def go_guess_to_py(lib, c_ptr) -> Guess:
+    """Standardizes the return of single-string 'Guess' functions."""
+    lang = go_str_to_py(lib, c_ptr)
+    # Original enry logic: if a language is returned, it's considered safe
+    return Guess(language=lang, safe=bool(lang))
